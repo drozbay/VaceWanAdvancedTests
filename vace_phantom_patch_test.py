@@ -1,4 +1,5 @@
 # This file extracted from drozpack (ablejones stuff) 2025-07-19
+# 2025-07-21: Added WanVacePhantomToVideo node
 # sorry if it doesn't work!
 
 import torch
@@ -369,7 +370,7 @@ class WanVaceToVideoAdvanced:
     RETURN_NAMES = ("positive", "negative", "latent", "trim_latent")
     FUNCTION = "encode"
 
-    CATEGORY = "conditioning/video_models"
+    CATEGORY = "drozpack/experimental"
 
     EXPERIMENTAL = True
 
@@ -446,8 +447,156 @@ class WanVaceToVideoAdvanced:
         out_latent = {}
         out_latent["samples"] = latent
         return (positive, negative, out_latent, trim_latent)
+    
+
+
+class WanVacePhantomToVideo:
+    def __init__(self) -> None:
+        pass
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"positive": ("CONDITIONING", ),
+                             "negative": ("CONDITIONING", ),
+                             "vae": ("VAE", ),
+                             "width": ("INT", {"default": 832, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 16}),
+                             "height": ("INT", {"default": 480, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 16}),
+                             "length": ("INT", {"default": 81, "min": 1, "max": nodes.MAX_RESOLUTION, "step": 4}),
+                             "batch_size": ("INT", {"default": 1, "min": 1, "max": 4096}),
+                             "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
+                },
+                "optional": {"control_video": ("IMAGE", ),
+                             "control_masks": ("MASK", ),
+                             "vace_references": ("IMAGE", ),
+                             "phantom_images": ("IMAGE", ),
+                             "phantom_mask_value": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Vace mask value for the Phantom embed region."}),
+                             "phantom_control_value": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Padded vace embedded latents value for the Phantom embed region."}),
+                }}
+
+    RETURN_TYPES = ("CONDITIONING", "CONDITIONING", "CONDITIONING", "LATENT", "INT")
+    RETURN_NAMES = ("positive", "negative", "neg_phant_img", "latent", "trim_latent")
+    FUNCTION = "encode"
+
+    CATEGORY = "drozpack/experimental"
+
+    EXPERIMENTAL = True
+
+    def encode(self, positive, negative, vae, width, height, length, batch_size, strength, 
+               control_video=None, control_masks=None, vace_references=None, phantom_images=None,
+               phantom_mask_value=0.0, phantom_control_value=0.5):
+        
+        # Get the number of images in the phantom_images
+        if phantom_images is not None:
+            num_phantom_images = min(length, phantom_images.shape[0])
+        else:
+            num_phantom_images = 0
+
+        # Calculate the additional length needed for Phantom images in Vace embeds
+        phantom_padding = num_phantom_images * 4
+        vace_length = length + phantom_padding
+
+        ########################
+        # execute WanVaceToVideo logic
+        vace_latent_length = ((vace_length - 1) // 4) + 1
+        if control_video is not None:
+            control_video = comfy.utils.common_upscale(control_video[:vace_length].movedim(-1, 1), width, height, "bilinear", "center").movedim(1, -1)
+            if control_video.shape[0] < vace_length:
+                control_video = torch.nn.functional.pad(control_video, (0, 0, 0, 0, 0, 0, 0, vace_length - control_video.shape[0]), value=0.5)
+        else:
+            control_video = torch.ones((vace_length, height, width, 3)) * 0.5
+
+        if vace_references is not None:
+            vace_references = comfy.utils.common_upscale(vace_references[:1].movedim(-1, 1), width, height, "bilinear", "center").movedim(1, -1)
+            vace_references = vae.encode(vace_references[:, :, :, :3])
+            vace_references = torch.cat([vace_references, comfy.latent_formats.Wan21().process_out(torch.zeros_like(vace_references))], dim=1)
+
+        if control_masks is None:
+            mask = torch.ones((vace_length, height, width, 1))
+        else:
+            mask = control_masks
+            if mask.ndim == 3:
+                mask = mask.unsqueeze(1)
+            mask = comfy.utils.common_upscale(mask[:vace_length], width, height, "bilinear", "center").movedim(1, -1)
+            if mask.shape[0] < vace_length:
+                mask = torch.nn.functional.pad(mask, (0, 0, 0, 0, 0, 0, 0, vace_length - mask.shape[0]), value=1.0)
+
+        #  modified mask for VACE processing
+        mask_modified = mask.clone()
+        
+        # Modify the phantom-overlapping portions if phantom images exist
+        if phantom_padding > 0:
+            # modify mask values for phantom padding region
+            mask_modified[length:, :, :, :] = phantom_mask_value
+            # modify control video values for phantom padding region
+            control_video[length:, :, :, :] = phantom_control_value
+        
+        control_video = control_video - 0.5
+        inactive = (control_video * (1 - mask_modified)) + 0.5
+        reactive = (control_video * mask_modified) + 0.5
+
+        inactive = vae.encode(inactive[:, :, :, :3])
+        reactive = vae.encode(reactive[:, :, :, :3])
+        control_video_latent = torch.cat((inactive, reactive), dim=1)
+        if vace_references is not None:
+            control_video_latent = torch.cat((vace_references, control_video_latent), dim=2)
+
+        vae_stride = 8
+        height_mask = height // vae_stride
+        width_mask = width // vae_stride
+        mask_modified = mask_modified.view(vace_length, height_mask, vae_stride, width_mask, vae_stride)
+        mask_modified = mask_modified.permute(2, 4, 0, 1, 3)
+        mask_modified = mask_modified.reshape(vae_stride * vae_stride, vace_length, height_mask, width_mask)
+        mask_modified = torch.nn.functional.interpolate(mask_modified.unsqueeze(0), size=(vace_latent_length, height_mask, width_mask), mode='nearest-exact').squeeze(0)
+
+        trim_latent = 0
+        if vace_references is not None:
+            mask_pad = torch.zeros_like(mask_modified[:, :vace_references.shape[2], :, :])
+            mask_modified = torch.cat((mask_pad, mask_modified), dim=1)
+            vace_latent_length += vace_references.shape[2]
+            trim_latent = vace_references.shape[2]
+
+        mask_modified = mask_modified.unsqueeze(0)
+
+        positive = node_helpers.conditioning_set_values(positive, {"vace_frames": [control_video_latent], "vace_mask": [mask_modified], "vace_strength": [strength]}, append=True)
+        negative = node_helpers.conditioning_set_values(negative, {"vace_frames": [control_video_latent], "vace_mask": [mask_modified], "vace_strength": [strength]}, append=True)
+
+        ######################
+        # execute WanPhantomSubjectToVideo logic
+        phantom_length = length
+        # Create the latent from WanPhantomSubjectToVideo (this will be our output latent)
+        latent = torch.zeros([batch_size, 16, ((phantom_length - 1) // 4) + 1, height // 8, width // 8], device=comfy.model_management.intermediate_device())
+        
+        # WanPhantomSubjectToVideo uses the negative from WanVace as input and creates two outputs
+        neg_phant_img = negative  # This becomes negative_img_text (with zeros)
+        
+        if phantom_images is not None:
+            phantom_images = comfy.utils.common_upscale(phantom_images[:phantom_length].movedim(-1, 1), width, height, "bilinear", "center").movedim(1, -1)
+            latent_images = []
+            for i in phantom_images:
+                latent_images += [vae.encode(i.unsqueeze(0)[:, :, :, :3])]
+            concat_latent_image = torch.cat(latent_images, dim=2)
+
+            # Apply phantom logic: positive gets the phantom images
+            positive = node_helpers.conditioning_set_values(positive, {"time_dim_concat": concat_latent_image})
+            # negative_text (cond2 in original) gets the phantom images 
+            negative = node_helpers.conditioning_set_values(negative, {"time_dim_concat": concat_latent_image})
+            # neg_phant_img (negative in original) gets zeros instead of phantom images
+            neg_phant_img = node_helpers.conditioning_set_values(negative, {"time_dim_concat": comfy.latent_formats.Wan21().process_out(torch.zeros_like(concat_latent_image))})
+
+        # Adjust latent size if reference image was provided (matching WanVaceToVideo logic)
+        if vace_references is not None:
+            # Prepend zeros to match the reference image dimensions
+            latent_pad = torch.zeros([batch_size, 16, vace_references.shape[2], height // 8, width // 8], device=latent.device, dtype=latent.dtype)
+            latent = torch.cat([latent_pad, latent], dim=2)
+        
+        out_latent = {}
+        out_latent["samples"] = latent
+        
+        return (positive, negative, neg_phant_img, out_latent, trim_latent)
+
 
 NODE_CLASS_MAPPINGS = {
+    "WanVacePhantomToVideo": WanVacePhantomToVideo,
     "VacePhantomWanModelPatcher": VacePhantomWanModelPatcher,
     "WanVaceToVideoAdvanced": WanVaceToVideoAdvanced,
 }
